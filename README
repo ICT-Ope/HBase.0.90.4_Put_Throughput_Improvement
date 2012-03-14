@@ -1,0 +1,18 @@
+Changes:
+* Add multi-thread flush and compaction to HBase-0.90.4
+* One HBase client process could use more than one connection to contact with one RegionServer
+* Disable Auto Split. !!be careful!!
+New Configurations:
+* hbase.hstore.flush.thread 20
+  the number of flush thread
+* hbase.hstore.compaction.thread 5
+  the number of compaction thread
+* hbase.hregion.memstore.flush.block.size 120000000
+  if region size reach this number, updates of this region will be blocked
+* client.connection.number 10
+  connection number of one client process to one RegionServer
+
+Recommended Configuration (for load test or for mainly writing workload)
+* ipc.server.read.threadpool.size 40
+* hbase.server.thread.wakefrequency 500
+* hbase.hstore.blockingStoreFiles 20000000
