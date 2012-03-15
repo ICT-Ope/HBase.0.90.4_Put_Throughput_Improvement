@@ -1,0 +1,1086 @@
+Index: src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+===================================================================
+--- src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java	(revision 324)
++++ src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java	(working copy)
+@@ -1015,7 +1015,7 @@
+    *
+    * @return false if file system is not available
+    */
+-  protected boolean checkFileSystem() {
++  public boolean checkFileSystem() {
+     if (this.fsOk && this.fs != null) {
+       try {
+         FSUtils.checkFileSystemAvailable(this.fs);
+Index: src/main/java/org/apache/hadoop/hbase/regionserver/handler/FlushRegionHandler.java
+===================================================================
+--- src/main/java/org/apache/hadoop/hbase/regionserver/handler/FlushRegionHandler.java	(revision 0)
++++ src/main/java/org/apache/hadoop/hbase/regionserver/handler/FlushRegionHandler.java	(revision 0)
+@@ -0,0 +1,114 @@
++package org.apache.hadoop.hbase.regionserver.handler;
++
++import java.io.IOException;
++
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hbase.DroppedSnapshotException;
++import org.apache.hadoop.hbase.RemoteExceptionHandler;
++import org.apache.hadoop.hbase.Server;
++import org.apache.hadoop.hbase.executor.EventHandler;
++import org.apache.hadoop.hbase.regionserver.HRegion;
++import org.apache.hadoop.hbase.regionserver.HRegionServer;
++import org.apache.hadoop.hbase.regionserver.MemStoreFlusher;
++import org.apache.hadoop.hbase.util.Bytes;
++/**
++ * 
++ * Deal with region flush
++ * @author liujiaatbuaa@yahoo.cn
++ *
++ */
++
++
++public class FlushRegionHandler extends EventHandler {
++  private static final Log LOG = LogFactory.getLog(FlushRegionHandler.class);
++  private HRegion region;
++  HRegionServer server;
++  Status status;
++  MemStoreFlusher flusher;
++
++  public FlushRegionHandler(Server server,HRegion region,MemStoreFlusher flusher) {
++    super(server, EventType.RS_ZK_REGION_FLUSH);
++    this.server = (HRegionServer) server;
++    this.region=region;
++    this.flusher=flusher;
++  }
++
++  @Override
++  public void process() throws IOException {
++    flush();
++
++  }
++
++  private void flush() {
++
++    boolean needsCompaction = false;
++
++    try {
++
++      needsCompaction = region.flushcache();
++
++      if (needsCompaction) {
++
++        // Had to change visibility of CompactSplit stuff to public
++
++        // TODO: Cleanup once compactions and splits are ripped apart
++
++        if (server != null) {
++          server.compactRegion(region.getRegionInfo(), false);
++        }
++
++        status = Status.NEEDS_COMPACTION;
++
++      } else {
++
++        status = Status.SUCCESS;
++
++      }
++
++    } catch (DroppedSnapshotException dse) {
++
++      // Cache flush can fail in a few places. If it fails in a critical
++
++      // section, we get a DroppedSnapshotException and a replay of hlog
++
++      // is required. Currently the only way to do this is a restart of
++
++      // the server. Abort because hdfs is probably bad (HBASE-644 is a case
++
++      // where hdfs was bad but passed the hdfs check).
++
++      LOG.fatal("Dropped a file during a flush, must abort server", dse);
++
++      server.abort("Dropped a flushed file, requires log replay", dse);
++
++      status = Status.FAILURE;
++
++    } catch (IOException e) {
++
++      LOG.error(
++          "Cache flush failed"
++              +
++
++              (region != null ? (" for region " + Bytes.toString(region
++                  .getRegionName())) : ""),
++
++          RemoteExceptionHandler.checkIOException(e));
++
++      server.checkFileSystem();
++
++      status = Status.FAILURE;
++
++    }
++    finally
++    {
++      this.flusher.removeFlushedRegion(region);
++    }
++  }
++
++  public enum Status {
++    FAILURE, NEEDS_COMPACTION, SUCCESS
++  };
++
++}
+Index: src/main/java/org/apache/hadoop/hbase/regionserver/handler/CompactionHandler.java
+===================================================================
+--- src/main/java/org/apache/hadoop/hbase/regionserver/handler/CompactionHandler.java	(revision 0)
++++ src/main/java/org/apache/hadoop/hbase/regionserver/handler/CompactionHandler.java	(revision 0)
+@@ -0,0 +1,68 @@
++package org.apache.hadoop.hbase.regionserver.handler;
++
++import java.io.IOException;
++
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hbase.RemoteExceptionHandler;
++import org.apache.hadoop.hbase.Server;
++import org.apache.hadoop.hbase.executor.EventHandler;
++import org.apache.hadoop.hbase.regionserver.CompactSplitThread;
++import org.apache.hadoop.hbase.regionserver.HRegion;
++import org.apache.hadoop.hbase.regionserver.HRegionServer;
++
++/**
++ * Deal with region compaction
++ * @author liujiaatbuaa@yahoo.cn
++ *
++ */
++public class CompactionHandler extends EventHandler {
++  private static final Log LOG = LogFactory.getLog(CompactionHandler.class);
++  private HRegion region;
++  HRegionServer server;
++  CompactSplitThread compactor;
++
++  public CompactionHandler(Server server, HRegion region,CompactSplitThread compactor) {
++    super(server, EventType.RS_ZK_REGION_COMPACT);
++    this.server = (HRegionServer) server;
++    this.region = region;
++    this.compactor=compactor;
++
++  }
++
++  @Override
++  public void process() throws IOException {
++    compact();
++
++  }
++
++  private void compact() {
++    try {
++      byte [] midKey=this.region.compactStores();
++      if (this.region.getLastCompactInfo() != null) {  // compaction aborted?
++         this.server.getMetrics().addCompaction(this.region.getLastCompactInfo());
++      }
++      if (this.compactor.shouldSplitRegion() && midKey != null &&
++          !this.server.isStopped()) {
++        this.compactor.split(this.region, midKey);
++      }
++    } catch (IOException ex) {
++      LOG.error("Compaction/Split failed for region " +
++          region.getRegionNameAsString(),
++        RemoteExceptionHandler.checkIOException(ex));
++      server.checkFileSystem();
++      
++    } catch (Exception ex) {
++      LOG.error("Compaction failed" +
++          (region != null ? (" for region " + region.getRegionNameAsString()) : ""),
++          ex);
++      server.checkFileSystem();
++    }
++    finally
++    {
++      this.compactor.cleanRegion(region);
++    }
++  }
++
++}
+Index: src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLog.java
+===================================================================
+--- src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLog.java	(revision 324)
++++ src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLog.java	(working copy)
+@@ -44,6 +44,7 @@
+ import java.util.concurrent.locks.Condition;
+ import java.util.concurrent.locks.Lock;
+ import java.util.concurrent.locks.ReentrantLock;
++import java.util.concurrent.locks.ReentrantReadWriteLock;
+ import java.util.regex.Matcher;
+ import java.util.regex.Pattern;
+ 
+@@ -198,7 +199,7 @@
+ 
+   // This lock prevents starting a log roll during a cache flush.
+   // synchronized is insufficient because a cache flush spans two method calls.
+-  private final Lock cacheFlushLock = new ReentrantLock();
++  private final ReentrantReadWriteLock cacheFlushLock = new ReentrantReadWriteLock();
+ 
+   // We synchronize on updateLock to prevent updates and to prevent a log roll
+   // during an update
+@@ -469,7 +470,7 @@
+       return null;
+     }
+     byte [][] regionsToFlush = null;
+-    this.cacheFlushLock.lock();
++    this.cacheFlushLock.writeLock().lock();
+     try {
+       if (closed) {
+         return regionsToFlush;
+@@ -528,7 +529,7 @@
+         }
+       }
+     } finally {
+-      this.cacheFlushLock.unlock();
++      this.cacheFlushLock.writeLock().unlock();
+     }
+     return regionsToFlush;
+   }
+@@ -798,7 +799,7 @@
+       LOG.error("Exception while waiting for syncer thread to die", e);
+     }
+ 
+-    cacheFlushLock.lock();
++    cacheFlushLock.writeLock().lock();
+     try {
+       // Tell our listeners that the log is closing
+       if (!this.listeners.isEmpty()) {
+@@ -814,7 +815,7 @@
+         this.writer.close();
+       }
+     } finally {
+-      cacheFlushLock.unlock();
++      cacheFlushLock.writeLock().unlock();
+     }
+   }
+ 
+@@ -1120,7 +1121,7 @@
+    * @see #abortCacheFlush()
+    */
+   public long startCacheFlush() {
+-    this.cacheFlushLock.lock();
++    this.cacheFlushLock.readLock().lock();
+     return obtainSeqNum();
+   }
+ 
+@@ -1159,7 +1160,7 @@
+       this.sync();
+ 
+     } finally {
+-      this.cacheFlushLock.unlock();
++      this.cacheFlushLock.readLock().unlock();
+     }
+   }
+ 
+@@ -1178,7 +1179,7 @@
+    * by the failure gets restored to the memstore.
+    */
+   public void abortCacheFlush() {
+-    this.cacheFlushLock.unlock();
++    this.cacheFlushLock.readLock().unlock();
+   }
+ 
+   /**
+Index: src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreFlusher.java
+===================================================================
+--- src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreFlusher.java	(revision 324)
++++ src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreFlusher.java	(working copy)
+@@ -25,6 +25,10 @@
+ import org.apache.hadoop.hbase.DroppedSnapshotException;
+ import org.apache.hadoop.hbase.HConstants;
+ import org.apache.hadoop.hbase.RemoteExceptionHandler;
++import org.apache.hadoop.hbase.executor.EventHandler;
++import org.apache.hadoop.hbase.executor.ExecutorService;
++import org.apache.hadoop.hbase.executor.ExecutorService.ExecutorType;
++import org.apache.hadoop.hbase.regionserver.handler.FlushRegionHandler;
+ import org.apache.hadoop.hbase.util.Bytes;
+ import org.apache.hadoop.util.StringUtils;
+ 
+@@ -39,9 +43,11 @@
+ import java.util.Set;
+ import java.util.SortedMap;
+ import java.util.TreeSet;
++import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.BlockingQueue;
+ import java.util.concurrent.DelayQueue;
+ import java.util.concurrent.Delayed;
++import java.util.concurrent.ThreadPoolExecutor;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.locks.Condition;
+@@ -56,7 +62,7 @@
+  *
+  * @see FlushRequester
+  */
+-class MemStoreFlusher extends Thread implements FlushRequester {
++public class MemStoreFlusher extends Thread implements FlushRequester {
+   static final Log LOG = LogFactory.getLog(MemStoreFlusher.class);
+   // These two data members go together.  Any entry in the one must have
+   // a corresponding entry in the other.
+@@ -116,6 +122,9 @@
+       ", globalMemStoreLimitLowMark=" +
+       StringUtils.humanReadableInt(this.globalMemStoreLimitLowMark) +
+       ", maxHeap=" + StringUtils.humanReadableInt(max));
++    this.executor= new ExecutorService(this.server.getServerName());
++    executor.startExecutorService(
++        ExecutorType.RS_REGION_FLUSH, server.getConfiguration().getInt("hbase.hstore.flush.thread", 20));
+   }
+ 
+   /**
+@@ -151,22 +160,23 @@
+    * @return true if successful
+    */
+   private boolean flushOneForGlobalPressure() {
+-    SortedMap<Long, HRegion> regionsBySize =
+-        server.getCopyOfOnlineRegionsSortedBySize();
++    SortedMap<Long, HRegion> regionsBySize = server
++        .getCopyOfOnlineRegionsSortedBySize();
+ 
+     // TODO: HBASE-3532 - we can't use Set<HRegion> here because it doesn't
+     // implement equals correctly. So, set of region names.
+-    Set<byte[]> excludedRegionNames = new TreeSet<byte[]>(Bytes.BYTES_COMPARATOR);
++    Set<byte[]> excludedRegionNames = new TreeSet<byte[]>(
++        Bytes.BYTES_COMPARATOR);
+ 
+     boolean flushedOne = false;
+     while (!flushedOne) {
+       // Find the biggest region that doesn't have too many storefiles
+       // (might be null!)
+-      HRegion bestFlushableRegion = getBiggestMemstoreRegion(
+-          regionsBySize, excludedRegionNames, true);
++      HRegion bestFlushableRegion = getBiggestMemstoreRegion(regionsBySize,
++          excludedRegionNames, true);
+       // Find the biggest region, total, even if it might have too many flushes.
+-      HRegion bestAnyRegion = getBiggestMemstoreRegion(
+-          regionsBySize, excludedRegionNames, false);
++      HRegion bestAnyRegion = getBiggestMemstoreRegion(regionsBySize,
++          excludedRegionNames, false);
+ 
+       if (bestAnyRegion == null) {
+         LOG.error("Above memory mark but there are no flushable regions!");
+@@ -174,37 +184,45 @@
+       }
+ 
+       HRegion regionToFlush;
+-      if (bestFlushableRegion != null &&
+-	  bestAnyRegion.memstoreSize.get() > 2 * bestFlushableRegion.memstoreSize.get()) {
+-        // Even if it's not supposed to be flushed, pick a region if it's more than twice
+-        // as big as the best flushable one - otherwise when we're under pressure we make
+-        // lots of little flushes and cause lots of compactions, etc, which just makes
++      if (bestFlushableRegion != null
++          && bestAnyRegion.memstoreSize.get() > 2 * bestFlushableRegion.memstoreSize
++              .get()) {
++        // Even if it's not supposed to be flushed, pick a region if it's more
++        // than twice
++        // as big as the best flushable one - otherwise when we're under
++        // pressure we make
++        // lots of little flushes and cause lots of compactions, etc, which just
++        // makes
+         // life worse!
+-        LOG.info("Under global heap pressure: " +
+-            "Region " + bestAnyRegion.getRegionNameAsString() + " has too many " +
+-            "store files, but is " +
+-            StringUtils.humanReadableInt(bestAnyRegion.memstoreSize.get()) +
+-            " vs best flushable region's " +
+-            StringUtils.humanReadableInt(bestFlushableRegion.memstoreSize.get()) +
+-            ". Choosing the bigger.");
+-	regionToFlush = bestAnyRegion;
++        // LOG.info("Under global heap pressure: " +
++        // "Region " + bestAnyRegion.getRegionNameAsString() + " has too many "
++        // +
++        // "store files, but is " +
++        // StringUtils.humanReadableInt(bestAnyRegion.memstoreSize.get()) +
++        // " vs best flushable region's " +
++        // StringUtils.humanReadableInt(bestFlushableRegion.memstoreSize.get())
++        // +
++        // ". Choosing the bigger.");
++        regionToFlush = bestAnyRegion;
+       } else {
+-	  if (bestFlushableRegion == null) {
+-	      regionToFlush = bestAnyRegion;
+-	  } else {
+-	      regionToFlush = bestFlushableRegion;
+-	  }
++        if (bestFlushableRegion == null) {
++          regionToFlush = bestAnyRegion;
++        } else {
++          regionToFlush = bestFlushableRegion;
++        }
+       }
+ 
+-      Preconditions.checkState(regionToFlush.memstoreSize.get() > 0);
++      // Preconditions.checkState(regionToFlush.memstoreSize.get() > 0);
+ 
+-      LOG.info("Flush of region " + regionToFlush + " due to global heap pressure");
++      // LOG.info("Flush of region " + regionToFlush +
++      // " due to global heap pressure");
+       flushedOne = flushRegion(regionToFlush, true);
+-      if (!flushedOne) {
+-        LOG.info("Excluding unflushable region " + regionToFlush +
+-          " - trying to find a different region to flush.");
+-        excludedRegionNames.add(regionToFlush.getRegionName());
+-      }
++      //performFlush(regionToFlush);
++      // if (!flushedOne) {
++      // LOG.info("Excluding unflushable region " + regionToFlush +
++      // " - trying to find a different region to flush.");
++      // excludedRegionNames.add(regionToFlush.getRegionName());
++      // }
+     }
+     return true;
+   }
+@@ -218,7 +236,7 @@
+         fqe = flushQueue.poll(threadWakeFrequency, TimeUnit.MILLISECONDS);
+         if (fqe == null || fqe instanceof WakeupFlushThread) {
+           if (isAboveLowWaterMark()) {
+-            LOG.info("Flush thread woke up with memory above low water.");
++            //LOG.info("Flush thread woke up with memory above low water.");
+             if (!flushOneForGlobalPressure()) {
+               // Wasn't able to flush any region, but we're above low water mark
+               // This is unlikely to happen, but might happen when closing the
+@@ -268,7 +286,10 @@
+ 
+   private void wakeupFlushThread() {
+     if (wakeupPending.compareAndSet(false, true)) {
+-      flushQueue.add(new WakeupFlushThread());
++      if(flushQueue.size()<5)
++      {
++       flushQueue.add(new WakeupFlushThread());
++      }
+     }
+   }
+ 
+@@ -291,10 +312,12 @@
+     return null;
+   }
+ 
++  static long printlg=0;
+   /**
+    * Return true if global memory usage is above the high watermark
+    */
+   private boolean isAboveHighWaterMark() {
++    
+     return server.getGlobalMemStoreSize() >= globalMemStoreLimit;
+   }
+ 
+@@ -306,6 +329,18 @@
+   }
+ 
+   public void requestFlush(HRegion r) {
++//    long maxStoreSize=r.memstoreSize.get();
++//    HRegion maxStoreRegion=r;
++//    for (HRegion region : this.server.onlineRegions.values()) {
++//      if(region.memstoreSize.get()>maxStoreSize)
++//      {
++//        maxStoreSize=region.memstoreSize.get();
++//        maxStoreRegion=region;
++//      }
++//    }
++//    r=maxStoreRegion;
++//    if(r.memstoreSize.get()<1024*1024)
++//      return;
+     synchronized (regionsInQueue) {
+       if (!regionsInQueue.containsKey(r)) {
+         // This entry has no delay so it will be added at the top of the flush
+@@ -333,6 +368,11 @@
+     }
+   }
+ 
++  ExecutorService executor;
++
++  public void performFlush(HRegion r) {
++    executor.submit(new FlushRegionHandler(this.server, r,this));
++  }
+   /*
+    * A flushRegion that checks store file count.  If too many, puts the flush
+    * on delay queue to retry later.
+@@ -368,6 +408,18 @@
+     return flushRegion(region, false);
+   }
+ 
++  /**
++   * Remove region from queue
++   * @param region
++   */
++  public void removeFlushedRegion(final HRegion region)
++ {
++    synchronized (this.regionsInQueue) {
++      FlushRegionEntry fqe = this.regionsInQueue.remove(region);
++      flushQueue.remove(fqe);
++    }
++
++  }
+   /*
+    * Flush a region.
+    * @param region Region to flush.
+@@ -381,40 +433,49 @@
+    * not flushed.
+    */
+   private boolean flushRegion(final HRegion region, final boolean emergencyFlush) {
+-    synchronized (this.regionsInQueue) {
+-      FlushRegionEntry fqe = this.regionsInQueue.remove(region);
+-      if (fqe != null && emergencyFlush) {
+-        // Need to remove from region from delay queue.  When NOT an
+-        // emergencyFlush, then item was removed via a flushQueue.poll.
+-        flushQueue.remove(fqe);
+-     }
+-     lock.lock();
+-    }
+-    try {
+-      if (region.flushcache()) {
+-        server.compactSplitThread.requestCompaction(region, getName());
+-      }
+-      server.getMetrics().addFlush(region.getRecentFlushInfo());
+-    } catch (DroppedSnapshotException ex) {
+-      // Cache flush can fail in a few places. If it fails in a critical
+-      // section, we get a DroppedSnapshotException and a replay of hlog
+-      // is required. Currently the only way to do this is a restart of
+-      // the server. Abort because hdfs is probably bad (HBASE-644 is a case
+-      // where hdfs was bad but passed the hdfs check).
+-      server.abort("Replay of HLog required. Forcing server shutdown", ex);
+-      return false;
+-    } catch (IOException ex) {
+-      LOG.error("Cache flush failed" +
+-        (region != null ? (" for region " + Bytes.toStringBinary(region.getRegionName())) : ""),
+-        RemoteExceptionHandler.checkIOException(ex));
+-      if (!server.checkFileSystem()) {
+-        return false;
+-      }
+-    } finally {
+-      flushOccurred.signalAll();
+-      lock.unlock();
+-    }
+-    return true;
++//    synchronized (this.regionsInQueue) {
++//      FlushRegionEntry fqe = this.regionsInQueue.remove(region);
++//      if (fqe != null && emergencyFlush) {
++//        // Need to remove from region from delay queue.  When NOT an
++//        // emergencyFlush, then item was removed via a flushQueue.poll.
++//        flushQueue.remove(fqe);
++//     }
++//     lock.lock();
++//    }
++//    try {
++      this.performFlush(region);
++      return true;
++//    } finally {
++//      lock.unlock();
++//    }
++//    return true;
++    
++    
++//    try {
++//      if (region.flushcache()) {
++//        server.compactSplitThread.requestCompaction(region, getName());
++//      }
++//      server.getMetrics().addFlush(region.getRecentFlushInfo());
++//    } catch (DroppedSnapshotException ex) {
++//      // Cache flush can fail in a few places. If it fails in a critical
++//      // section, we get a DroppedSnapshotException and a replay of hlog
++//      // is required. Currently the only way to do this is a restart of
++//      // the server. Abort because hdfs is probably bad (HBASE-644 is a case
++//      // where hdfs was bad but passed the hdfs check).
++//      server.abort("Replay of HLog required. Forcing server shutdown", ex);
++//      return false;
++//    } catch (IOException ex) {
++//      LOG.error("Cache flush failed" +
++//        (region != null ? (" for region " + Bytes.toStringBinary(region.getRegionName())) : ""),
++//        RemoteExceptionHandler.checkIOException(ex));
++//      if (!server.checkFileSystem()) {
++//        return false;
++//      }
++//    } finally {
++//      flushOccurred.signalAll();
++//      lock.unlock();
++//    }
++//    return true;
+   }
+ 
+   private boolean isTooManyStoreFiles(HRegion region) {
+@@ -434,20 +495,26 @@
+    */
+   public synchronized void reclaimMemStoreMemory() {
+     if (isAboveHighWaterMark()) {
++      printlg++;
++      if(printlg%10000==0)
++      {
++        LOG.info("MemoStore size:"+server.getGlobalMemStoreSize()+" limit size:"+globalMemStoreLimit);
++      }
+       lock.lock();
+       try {
+         while (isAboveHighWaterMark() && !server.isStopped()) {
++         
+           wakeupFlushThread();
+           try {
+             // we should be able to wait forever, but we've seen a bug where
+             // we miss a notify, so put a 5 second bound on it at least.
+-            flushOccurred.await(5, TimeUnit.SECONDS);
++            flushOccurred.await(1, TimeUnit.SECONDS);
+           } catch (InterruptedException ie) {
+             Thread.currentThread().interrupt();
+           }
+         }
+       } finally {
+-        lock.unlock();
++       lock.unlock();
+       }
+     } else if (isAboveLowWaterMark()) {
+       wakeupFlushThread();
+Index: src/main/java/org/apache/hadoop/hbase/regionserver/CompactSplitThread.java
+===================================================================
+--- src/main/java/org/apache/hadoop/hbase/regionserver/CompactSplitThread.java	(revision 324)
++++ src/main/java/org/apache/hadoop/hbase/regionserver/CompactSplitThread.java	(working copy)
+@@ -20,6 +20,7 @@
+ package org.apache.hadoop.hbase.regionserver;
+ 
+ import java.io.IOException;
++import java.util.HashSet;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.locks.ReentrantLock;
+ 
+@@ -27,6 +28,10 @@
+ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hbase.RemoteExceptionHandler;
++import org.apache.hadoop.hbase.executor.ExecutorService;
++import org.apache.hadoop.hbase.executor.ExecutorService.ExecutorType;
++import org.apache.hadoop.hbase.regionserver.handler.CompactionHandler;
++import org.apache.hadoop.hbase.regionserver.handler.FlushRegionHandler;
+ import org.apache.hadoop.util.StringUtils;
+ 
+ /**
+@@ -42,6 +47,8 @@
+ 
+   private final PriorityCompactionQueue compactionQueue =
+     new PriorityCompactionQueue();
++  private final HashSet<HRegion> compactionSet =
++      new HashSet<HRegion>();
+ 
+   /* The default priority for user-specified compaction requests.
+    * The user gets top priority unless we have blocking compactions. (Pri <= 0)
+@@ -54,7 +61,7 @@
+    * stop splitting after number of online regions is greater than this.
+    */
+   private int regionSplitLimit;
+-
++  ExecutorService executor;
+   /** @param server */
+   public CompactSplitThread(HRegionServer server) {
+     super();
+@@ -65,8 +72,13 @@
+     this.frequency =
+       conf.getLong("hbase.regionserver.thread.splitcompactcheckfrequency",
+       20 * 1000);
++    this.executor= new ExecutorService(this.server.getServerName());
++    executor.startExecutorService(
++        ExecutorType.RS_REGION_COMPACT, server.getConfiguration().getInt("hbase.hstore.compaction.thread", 15));
+   }
+-
++  public void performCompact(HRegion r) {
++    executor.submit(new CompactionHandler(this.server, r,this));
++  }
+   @Override
+   public void run() {
+     while (!this.server.isStopped()) {
+@@ -78,14 +90,19 @@
+           try {
+             if(!this.server.isStopped()) {
+               // Don't interrupt us while we are working
+-              byte [] midKey = r.compactStores();
+-              if (r.getLastCompactInfo() != null) {  // compaction aborted?
+-                this.server.getMetrics().addCompaction(r.getLastCompactInfo());
+-              }
+-              if (shouldSplitRegion() && midKey != null &&
+-                  !this.server.isStopped()) {
+-                split(r, midKey);
+-              }
++              this.performCompact(r);
++              Thread.sleep(1000);
++              
++              
++//              byte [] midKey = r.compactStores();
++//              if (r.getLastCompactInfo() != null) {  // compaction aborted?
++//                this.server.getMetrics().addCompaction(r.getLastCompactInfo());
++//              }
++//              if (shouldSplitRegion() && midKey != null &&
++//                  !this.server.isStopped()) {
++//                //disable split
++//                //split(r, midKey);
++//              }
+             }
+           } finally {
+             lock.unlock();
+@@ -93,13 +110,6 @@
+         }
+       } catch (InterruptedException ex) {
+         continue;
+-      } catch (IOException ex) {
+-        LOG.error("Compaction/Split failed for region " +
+-            r.getRegionNameAsString(),
+-          RemoteExceptionHandler.checkIOException(ex));
+-        if (!server.checkFileSystem()) {
+-          break;
+-        }
+       } catch (Exception ex) {
+         LOG.error("Compaction failed" +
+             (r != null ? (" for region " + r.getRegionNameAsString()) : ""),
+@@ -112,7 +122,10 @@
+     compactionQueue.clear();
+     LOG.info(getName() + " exiting");
+   }
+-
++  public synchronized void cleanRegion(HRegion r)
++  {
++    this.compactionSet.remove(r);
++  }
+   public synchronized void requestCompaction(final HRegion r,
+       final String why) {
+     requestCompaction(r, false, why, r.getCompactPriority());
+@@ -133,19 +146,28 @@
+     if (this.server.isStopped()) {
+       return;
+     }
++    if(this.compactionSet.contains(r))
++      return;
+     // tell the region to major-compact (and don't downgrade it)
+     if (force) {
+       r.setForceMajorCompaction(force);
+     }
+-    if (compactionQueue.add(r, priority) && LOG.isDebugEnabled()) {
++    boolean added=compactionQueue.add(r, priority) ;
++    if(added)
++    {
++      this.compactionSet.add(r);
++    }
++    if (added && LOG.isDebugEnabled()) {
+       LOG.debug("Compaction " + (force? "(major) ": "") +
+         "requested for " + r.getRegionNameAsString() +
+         (why != null && !why.isEmpty()? " because " + why: "") +
+         "; priority=" + priority + ", compaction queue size=" + compactionQueue.size());
++      
+     }
++    
+   }
+ 
+-  private void split(final HRegion parent, final byte [] midKey)
++  public void split(final HRegion parent, final byte [] midKey)
+   throws IOException {
+     final long startTime = System.currentTimeMillis();
+     SplitTransaction st = new SplitTransaction(parent, midKey);
+@@ -205,7 +227,7 @@
+     return compactionQueue.size();
+   }
+ 
+-  private boolean shouldSplitRegion() {
++  public boolean shouldSplitRegion() {
+     return (regionSplitLimit > server.getNumberOfOnlineRegions());
+   }
+ 
+Index: src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+===================================================================
+--- src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java	(revision 324)
++++ src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java	(working copy)
+@@ -235,7 +235,7 @@
+ 
+   // Stop updates lock
+   private final ReentrantReadWriteLock updatesLock =
+-    new ReentrantReadWriteLock();
++    new ReentrantReadWriteLock(true);
+   private boolean splitRequest;
+   private byte[] splitPoint = null;
+ 
+@@ -308,8 +308,11 @@
+                       HTableDescriptor.DEFAULT_MEMSTORE_FLUSH_SIZE);
+     }
+     this.memstoreFlushSize = flushSize;
+-    this.blockingMemStoreSize = this.memstoreFlushSize *
+-      conf.getLong("hbase.hregion.memstore.block.multiplier", 2);
++    this.blockingMemStoreSize = 
++        conf.getLong("hbase.hregion.memstore.flush.block.size",
++           120000000);
++        //this.memstoreFlushSize *
++      //conf.getLong("hbase.hregion.memstore.block.multiplier", 2);
+     if (LOG.isDebugEnabled()) {
+       // Write out region name as string and its encoded name.
+       LOG.debug("Instantiated " + this);
+@@ -901,6 +904,7 @@
+    * because a Snapshot was not properly persisted.
+    */
+   protected boolean internalFlushcache() throws IOException {
++    //
+     return internalFlushcache(this.log, -1);
+   }
+ 
+@@ -945,6 +949,7 @@
+     this.updatesLock.writeLock().lock();
+     final long currentMemStoreSize = this.memstoreSize.get();
+     List<StoreFlusher> storeFlushers = new ArrayList<StoreFlusher>(stores.size());
++    boolean compactionRequested = false;
+     try {
+       sequenceId = (wal == null)? myseqid: wal.startCacheFlush();
+       completeSequenceId = this.getCompleteCacheFlushSequenceId(sequenceId);
+@@ -957,9 +962,7 @@
+       for (StoreFlusher flusher : storeFlushers) {
+         flusher.prepare();
+       }
+-    } finally {
+-      this.updatesLock.writeLock().unlock();
+-    }
++    
+ 
+     LOG.debug("Finished snapshotting, commencing flushing stores");
+ 
+@@ -967,7 +970,7 @@
+     // restart so hlog content can be replayed and put back into the memstore.
+     // Otherwise, the snapshot content while backed up in the hlog, it will not
+     // be part of the current running servers state.
+-    boolean compactionRequested = false;
++    
+     try {
+       // A.  Flush memstore to all the HStores.
+       // Keep running vector of all store files that includes both old and the
+@@ -995,12 +998,17 @@
+       // We used to only catch IOEs but its possible that we'd get other
+       // exceptions -- e.g. HBASE-659 was about an NPE -- so now we catch
+       // all and sundry.
++      LOG.error(t);
+       if (wal != null) wal.abortCacheFlush();
+       DroppedSnapshotException dse = new DroppedSnapshotException("region: " +
+           Bytes.toStringBinary(getRegionName()));
+       dse.initCause(t);
+       throw dse;
+     }
++    
++    } finally {
++      this.updatesLock.writeLock().unlock();
++    }
+ 
+     // If we get to here, the HStores have been written. If we get an
+     // error in completeCacheFlush it will release the lock it is holding
+@@ -1024,7 +1032,7 @@
+     long time = EnvironmentEdgeManager.currentTimeMillis() - startTime;
+     if (LOG.isDebugEnabled()) {
+       LOG.info("Finished memstore flush of ~" +
+-        StringUtils.humanReadableInt(currentMemStoreSize) + " for region " +
++        currentMemStoreSize +"  current :"+this.memstoreSize.get()+ " for region " +
+         this + " in " + time + "ms, sequenceid=" + sequenceId +
+         ", compaction requested=" + compactionRequested +
+         ((wal == null)? "; wal=null": ""));
+@@ -1200,6 +1208,7 @@
+     boolean flush = false;
+ 
+     updatesLock.readLock().lock();
++  
+ 
+     try {
+ 
+Index: src/main/java/org/apache/hadoop/hbase/HBaseConfiguration.java
+===================================================================
+--- src/main/java/org/apache/hadoop/hbase/HBaseConfiguration.java	(revision 324)
++++ src/main/java/org/apache/hadoop/hbase/HBaseConfiguration.java	(working copy)
+@@ -62,11 +62,11 @@
+   private static void checkDefaultsVersion(Configuration conf) {
+     String defaultsVersion = conf.get("hbase.defaults.for.version");
+     String thisVersion = VersionInfo.getVersion();
+-    if (!thisVersion.equals(defaultsVersion)) {
+-      throw new RuntimeException(
+-        "hbase-default.xml file seems to be for and old version of HBase (" +
+-        defaultsVersion + "), this version is " + thisVersion);
+-    }
++//    if (!thisVersion.equals(defaultsVersion)) {
++//      throw new RuntimeException(
++//        "hbase-default.xml file seems to be for and old version of HBase (" +
++//        defaultsVersion + "), this version is " + thisVersion);
++//    }
+   }
+ 
+   private static void checkForClusterFreeMemoryLimit(Configuration conf) {
+Index: src/main/java/org/apache/hadoop/hbase/executor/ExecutorService.java
+===================================================================
+--- src/main/java/org/apache/hadoop/hbase/executor/ExecutorService.java	(revision 324)
++++ src/main/java/org/apache/hadoop/hbase/executor/ExecutorService.java	(working copy)
+@@ -84,7 +84,9 @@
+     RS_OPEN_META               (22),
+     RS_CLOSE_REGION            (23),
+     RS_CLOSE_ROOT              (24),
+-    RS_CLOSE_META              (25);
++    RS_CLOSE_META              (25),
++    RS_REGION_FLUSH            (27),
++    RS_REGION_COMPACT            (28);
+ 
+     ExecutorType(int value) {}
+ 
+@@ -105,7 +107,10 @@
+   public ExecutorType getExecutorServiceType(final EventHandler.EventType type) {
+     switch(type) {
+       // Master executor services
+-
++      case RS_ZK_REGION_COMPACT:
++        return ExecutorType.RS_REGION_COMPACT;
++      case RS_ZK_REGION_FLUSH:
++        return ExecutorType.RS_REGION_FLUSH;
+       case RS_ZK_REGION_CLOSED:
+         return ExecutorType.MASTER_CLOSE_REGION;
+ 
+@@ -264,6 +269,7 @@
+           keepAliveTimeInMillis, TimeUnit.MILLISECONDS, q);
+       // name the threads for this threadpool
+       ThreadFactoryBuilder tfb = new ThreadFactoryBuilder();
++      tfb.setPriority(Thread.MAX_PRIORITY);
+       tfb.setNameFormat(this.name + "-%d");
+       this.threadPoolExecutor.setThreadFactory(tfb.build());
+     }
+Index: src/main/java/org/apache/hadoop/hbase/executor/EventHandler.java
+===================================================================
+--- src/main/java/org/apache/hadoop/hbase/executor/EventHandler.java	(revision 324)
++++ src/main/java/org/apache/hadoop/hbase/executor/EventHandler.java	(working copy)
+@@ -107,7 +107,8 @@
+     RS_ZK_REGION_CLOSED       (2),   // RS has finished closing a region
+     RS_ZK_REGION_OPENING      (3),   // RS is in process of opening a region
+     RS_ZK_REGION_OPENED       (4),   // RS has finished opening a region
+-
++    RS_ZK_REGION_FLUSH      (27),   // RS has finished opening a region
++    RS_ZK_REGION_COMPACT      (28),   // RS has finished opening a region
+     // Messages originating from Master to RS
+     M_RS_OPEN_REGION          (20),  // Master asking RS to open a region
+     M_RS_OPEN_ROOT            (21),  // Master asking RS to open root
+Index: src/main/java/org/apache/hadoop/hbase/ipc/HBaseClient.java
+===================================================================
+--- src/main/java/org/apache/hadoop/hbase/ipc/HBaseClient.java	(revision 324)
++++ src/main/java/org/apache/hadoop/hbase/ipc/HBaseClient.java	(working copy)
+@@ -84,12 +84,14 @@
+ 
+   protected final SocketFactory socketFactory;           // how to create sockets
+   private int refCount = 1;
++  private int connetionNumber=40;
+ 
+   final private static String PING_INTERVAL_NAME = "ipc.ping.interval";
+   final private static String SOCKET_TIMEOUT = "ipc.socket.timeout";
+   final static int DEFAULT_PING_INTERVAL = 60000;  // 1 min
+   final static int DEFAULT_SOCKET_TIMEOUT = 20000; // 20 seconds
+   final static int PING_CALL_ID = -1;
++  
+ 
+   /**
+    * set the ping interval value in configuration
+@@ -212,7 +214,7 @@
+     private IOException closeException; // close reason
+ 
+     public Connection(InetSocketAddress address) throws IOException {
+-      this(new ConnectionId(address, null, 0));
++      this(new ConnectionId(address, null, 0,getConnectionFlag()));
+     }
+ 
+     public Connection(ConnectionId remoteId) throws IOException {
+@@ -684,8 +686,16 @@
+     }
+     this.conf = conf;
+     this.socketFactory = factory;
++    this.connetionNumber=this.conf.getInt("client.connection.number", 10);
+   }
+-
++  static int flag=0;
++  private synchronized int getConnectionFlag()
++  {
++    flag++;
++    if(flag>1000)
++      flag=0;
++    return flag%this.connetionNumber;
++  }
+   /**
+    * Construct an IPC client with the default SocketFactory
+    * @param valueClass value class
+@@ -865,7 +875,7 @@
+      * connectionsId object and with set() method. We need to manage the
+      * refs for keys in HashMap properly. For now its ok.
+      */
+-    ConnectionId remoteId = new ConnectionId(addr, ticket, rpcTimeout);
++    ConnectionId remoteId = new ConnectionId(addr, ticket, rpcTimeout,getConnectionFlag());
+     do {
+       synchronized (connections) {
+         connection = connections.get(remoteId);
+@@ -892,12 +902,13 @@
+     final InetSocketAddress address;
+     final UserGroupInformation ticket;
+     final private int rpcTimeout;
+-
++    final int flag;
+     ConnectionId(InetSocketAddress address, UserGroupInformation ticket,
+-        int rpcTimeout) {
++        int rpcTimeout,int flag) {
+       this.address = address;
+       this.ticket = ticket;
+       this.rpcTimeout = rpcTimeout;
++      this.flag=flag;
+     }
+ 
+     InetSocketAddress getAddress() {
+@@ -912,7 +923,7 @@
+      if (obj instanceof ConnectionId) {
+        ConnectionId id = (ConnectionId) obj;
+        return address.equals(id.address) && ticket == id.ticket && 
+-       rpcTimeout == id.rpcTimeout;
++       rpcTimeout == id.rpcTimeout && flag==id.flag;
+        //Note : ticket is a ref comparision.
+      }
+      return false;
+Index: src/main/resources/hbase-default.xml
+===================================================================
+--- src/main/resources/hbase-default.xml	(revision 324)
++++ src/main/resources/hbase-default.xml	(working copy)
+@@ -22,7 +22,31 @@
+  */
+ -->
+ <configuration>
++<property>
++    <name>ipc.server.read.threadpool.size</name>
++    <value>40</value>
++  </property> 
+   <property>
++    <name>hbase.hstore.flush.thread</name>
++    <value>30</value>
++  </property>
++  <property>
++    <name>hbase.hstore.compaction.thread</name>
++    <value>1</value>
++  </property>
++  <property>
++    <name>hbase.hregion.memstore.flush.block.size</name>
++    <value>120000000</value>
++    <description>
++    </description>
++  </property>
++	 <property>
++    <name>client.connection.number</name>
++    <value>10</value>
++    <description>
++    </description>
++  </property>
++  <property>
+     <name>hbase.rootdir</name>
+     <value>file:///tmp/hbase-${user.name}/hbase</value>
+     <description>The directory shared by region servers and into
+@@ -318,7 +342,7 @@
+   </property>
+   <property>
+     <name>hbase.server.thread.wakefrequency</name>
+-    <value>10000</value>
++    <value>500</value>
+     <description>Time to sleep in between searches for work (in milliseconds).
+     Used as sleep interval by service threads such as log roller.
+     </description>
+@@ -390,7 +414,7 @@
+   </property>
+   <property>
+     <name>hbase.hstore.blockingStoreFiles</name>
+-    <value>7</value>
++    <value>70000000</value>
+     <description>
+     If more than this number of StoreFiles in any one Store
+     (one StoreFile is written per flush of MemStore) then updates are
