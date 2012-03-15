@@ -414,7 +414,7 @@ Index: src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreFlusher.java
 -          " - trying to find a different region to flush.");
 -        excludedRegionNames.add(regionToFlush.getRegionName());
 -      }
-+      performFlush(regionToFlush);
++      //performFlush(regionToFlush);
 +      // if (!flushedOne) {
 +      // LOG.info("Excluding unflushable region " + regionToFlush +
 +      // " - trying to find a different region to flush.");
